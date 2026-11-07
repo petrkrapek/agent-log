@@ -2,9 +2,13 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(not(unix))]
+compile_error!("agent-log vyžaduje Unix kvůli O_NOFOLLOW, flock a právům 0o600");
+
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{Local, SecondsFormat};
@@ -31,6 +35,7 @@ pub enum Error {
     MessageTooLong { len: usize, max: usize },
     OutsideWorkspace,
     Symlink,
+    HardLink,
     NotAFile,
     Missing,
     SkippedLines(usize),
@@ -48,6 +53,7 @@ impl std::fmt::Display for Error {
                 "cesta k logu musí zůstat v aktuálním adresáři; pro jinou cestu použijte --allow-outside"
             ),
             Self::Symlink => write!(f, "cesta k logu nesmí obsahovat symlink"),
+            Self::HardLink => write!(f, "soubor logu nesmí mít další pevný odkaz (hard link)"),
             Self::NotAFile => write!(f, "cíl musí být obyčejný soubor"),
             Self::Missing => write!(f, "log neexistuje"),
             Self::SkippedLines(n) => write!(f, "{}", skipped_lines_message(*n)),
@@ -85,13 +91,12 @@ fn skipped_lines_message(n: usize) -> String {
 }
 
 fn map_io(err: io::Error) -> Error {
-    #[cfg(unix)]
     match err.raw_os_error() {
-        Some(libc::ELOOP) => return Error::Symlink,
-        Some(libc::EISDIR) => return Error::NotAFile,
-        _ => {}
+        Some(libc::ELOOP) => Error::Symlink,
+        // ENXIO vrací neblokující open FIFO pro zápis, když ji nikdo nečte.
+        Some(libc::EISDIR | libc::ENXIO) => Error::NotAFile,
+        _ => Error::Io(err),
     }
-    Error::Io(err)
 }
 
 /// Text bezpečný pro vypsání do terminálu: řídicí, oddělovací a bidi znaky
@@ -156,13 +161,20 @@ pub fn add_entry(
     line.push(b'\n');
 
     let mut log = open_log(&path, OpenMode::Append)?;
-    lock_exclusive(&log)?;
+    unix_fs::flock_exclusive(&log)?;
     restrict_permissions(&log)?;
+    // Useknutý poslední řádek (ruční úprava, plný disk) by se jinak slepil s novým záznamem.
+    if !ends_with_newline(&log)? {
+        line.insert(0, b'\n');
+    }
     log.write_all(&line)?;
     Ok(entry)
 }
 
 /// Vypíše záznamy. Poškozené řádky přeskočí a vrátí chybu, když nějaké byly.
+///
+/// Zámek se drží jen po dobu čtení souboru. Pomalý čtenář výstupu (např. pager)
+/// tak neblokuje souběžné `add`.
 pub fn list_entries(
     base_dir: &Path,
     file: &Path,
@@ -176,33 +188,12 @@ pub fn list_entries(
         Err(Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => return Err(Error::Missing),
         Err(err) => return Err(err),
     };
-    lock_shared(&log)?;
-    let mut reader = BufReader::new(log);
-    let mut skipped = 0usize;
-    let mut seen_valid = false;
-    let mut tail = VecDeque::new();
+    let (entries, skipped) = read_entries(log, limit)?;
 
-    while let Some(line) = read_line_capped(&mut reader, MAX_LINE_BYTES)? {
-        let Some(entry) = parse_line(line, &mut skipped)? else {
-            continue;
-        };
-        seen_valid = true;
-        if limit == 0 {
-            writeln!(out, "{}", format_entry(&entry))?;
-        } else {
-            if tail.len() == limit {
-                tail.pop_front();
-            }
-            tail.push_back(entry);
-        }
+    for entry in &entries {
+        writeln!(out, "{}", format_entry(entry))?;
     }
-
-    if limit > 0 {
-        for entry in &tail {
-            writeln!(out, "{}", format_entry(entry))?;
-        }
-    }
-    if !seen_valid && skipped == 0 {
+    if entries.is_empty() && skipped == 0 {
         writeln!(out, "Log je prázdný.")?;
     }
     if skipped > 0 {
@@ -215,34 +206,61 @@ pub fn list_entries(
 pub fn clear_log(base_dir: &Path, file: &Path, allow_outside: bool) -> Result<(), Error> {
     let path = resolve_log_path(base_dir, file, allow_outside)?;
     let log = open_log(&path, OpenMode::Write)?;
-    lock_exclusive(&log)?;
+    unix_fs::flock_exclusive(&log)?;
     restrict_permissions(&log)?;
     log.set_len(0)?;
     Ok(())
 }
 
-fn parse_line(line: Line, skipped: &mut usize) -> Result<Option<Entry>, Error> {
+/// Přečte platné záznamy pod sdíleným zámkem a vrátí je s počtem poškozených řádků.
+/// Při `limit > 0` drží jen posledních `limit` záznamů. Zámek uvolní zavřením souboru.
+fn read_entries(log: File, limit: usize) -> Result<(VecDeque<Entry>, usize), Error> {
+    unix_fs::flock_shared(&log)?;
+    let mut reader = BufReader::new(log);
+    let mut skipped = 0usize;
+    let mut entries = VecDeque::new();
+
+    while let Some(line) = read_line_capped(&mut reader, MAX_LINE_BYTES)? {
+        let Some(entry) = parse_line(line, &mut skipped) else {
+            continue;
+        };
+        if limit > 0 && entries.len() == limit {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+    Ok((entries, skipped))
+}
+
+fn parse_line(line: Line, skipped: &mut usize) -> Option<Entry> {
     let bytes = match line {
         Line::TooLong => {
             *skipped += 1;
-            return Ok(None);
+            return None;
         }
         Line::Bytes(bytes) => bytes,
     };
     if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(None);
+        return None;
     }
-    let Ok(text) = String::from_utf8(bytes) else {
+    let entry = String::from_utf8(bytes)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Entry>(&text).ok());
+    if entry.is_none() {
         *skipped += 1;
-        return Ok(None);
-    };
-    match serde_json::from_str::<Entry>(&text) {
-        Ok(entry) => Ok(Some(entry)),
-        Err(_) => {
-            *skipped += 1;
-            Ok(None)
-        }
     }
+    entry
+}
+
+/// Soubor je prázdný, nebo končí znakem `\n`.
+fn ends_with_newline(file: &File) -> io::Result<bool> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    let mut last = [0u8; 1];
+    file.read_exact_at(&mut last, len - 1)?;
+    Ok(last[0] == b'\n')
 }
 
 enum Line {
@@ -363,175 +381,47 @@ enum OpenMode {
 }
 
 fn open_log(path: &Path, mode: OpenMode) -> Result<File, Error> {
-    #[cfg(unix)]
-    {
-        unix_fs::open_log(path, mode)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        compile_error!("agent-log vyžaduje Unix kvůli O_NOFOLLOW, flock a právům 0o600");
-    }
-}
-
-fn lock_exclusive(file: &File) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        unix_fs::flock_exclusive(file)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Ok(())
-    }
-}
-
-fn lock_shared(file: &File) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        unix_fs::flock_shared(file)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Ok(())
-    }
+    unix_fs::open_log(path, mode)
 }
 
 fn restrict_permissions(file: &File) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Ok(())
-    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
-#[cfg(unix)]
 #[allow(unsafe_code)]
 mod unix_fs {
     use std::ffi::{CString, OsStr};
     use std::fs::File;
     use std::io::{self, ErrorKind};
-    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Component, Path};
 
     use super::{map_io, Error, OpenMode};
 
-    struct OwnedFd(RawFd);
-
-    impl OwnedFd {
-        fn open_root() -> io::Result<Self> {
-            let fd = cvt_fd(unsafe {
-                libc::open(
-                    c"/".as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-                )
-            })?;
-            Ok(Self(fd))
-        }
-
-        fn open_dir(&self, name: &CString) -> io::Result<Self> {
-            let fd = unsafe {
-                libc::openat(
-                    self.0,
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd >= 0 {
-                return Ok(Self(fd));
-            }
-            let err = io::Error::last_os_error();
-            // Linux vrací u symlinku s O_DIRECTORY kód ENOTDIR, ne ELOOP.
-            if err.raw_os_error() == Some(libc::ENOTDIR) && self.is_symlink(name) {
-                return Err(io::Error::from_raw_os_error(libc::ELOOP));
-            }
-            Err(err)
-        }
-
-        fn is_symlink(&self, name: &CString) -> bool {
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: `name` je C řetězec a `stat` je výstupní buffer volání `fstatat`.
-            // `AT_SYMLINK_NOFOLLOW` čte samotný symlink v adresáři, který už držíme.
-            let rc = unsafe {
-                libc::fstatat(
-                    self.0,
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if rc != 0 {
-                return false;
-            }
-            // SAFETY: `fstatat` uspěl, takže buffer je inicializovaný.
-            let stat = unsafe { stat.assume_init() };
-            (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
-        }
-
-        fn open_file(&self, name: &CString, mode: OpenMode) -> io::Result<Self> {
-            let flags = match mode {
-                OpenMode::Read => libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                OpenMode::Append => {
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_APPEND
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC
-                }
-                OpenMode::Write => {
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC
-                }
-            };
-            let fd = cvt_fd(unsafe {
-                libc::openat(self.0, name.as_ptr(), flags, 0o600 as libc::mode_t)
-            })?;
-            Ok(Self(fd))
-        }
-
-        fn into_file(mut self) -> File {
-            let fd = self.0;
-            self.0 = -1;
-            // SAFETY: `fd` je otevřený deskriptor, který odteď vlastní `File`.
-            // Guard má `-1`, takže `Drop` ho nezavře podruhé.
-            unsafe { File::from_raw_fd(fd) }
-        }
-    }
-
-    impl Drop for OwnedFd {
-        fn drop(&mut self) {
-            if self.0 >= 0 {
-                // SAFETY: deskriptor vlastní tento guard a ještě nebyl předán `File`.
-                unsafe { libc::close(self.0) };
-            }
-        }
-    }
-
+    /// Otevře log procházením cesty od `/` přes `openat` s `O_NOFOLLOW` v každém kroku.
+    /// Odmítne symlink, pevný odkaz i cokoli jiného než obyčejný soubor.
     pub(super) fn open_log(path: &Path, mode: OpenMode) -> Result<File, Error> {
         let parts = split_absolute(path)?;
-        let file_name = parts[parts.len() - 1];
-        let mut dir = OwnedFd::open_root().map_err(map_io)?;
-        for component in &parts[..parts.len() - 1] {
-            let name = c_name(component)?;
-            dir = dir.open_dir(&name).map_err(map_io)?;
+        let Some((file_name, dirs)) = parts.split_last() else {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "prázdná cesta k logu").into());
+        };
+        let mut dir = open_root().map_err(map_io)?;
+        for component in dirs {
+            dir = open_dir(&dir, &c_name(component)?).map_err(map_io)?;
         }
-        let name = c_name(file_name)?;
-        let file = dir.open_file(&name, mode).map_err(map_io)?.into_file();
+        let file = File::from(open_file(&dir, &c_name(file_name)?, mode).map_err(map_io)?);
         let meta = file.metadata()?;
-        if meta.is_dir() {
-            return Err(Error::NotAFile);
-        }
         if !meta.is_file() {
             return Err(Error::NotAFile);
         }
+        // Pevný odkaz vede na cizí soubor, který by `add` a `clear` přepsaly a `list` vypsal.
+        if meta.nlink() != 1 {
+            return Err(Error::HardLink);
+        }
+        clear_nonblock(&file)?;
         Ok(file)
     }
 
@@ -541,6 +431,92 @@ mod unix_fs {
 
     pub(super) fn flock_shared(file: &File) -> Result<(), Error> {
         flock_wait(file.as_raw_fd(), libc::LOCK_SH)
+    }
+
+    fn open_root() -> io::Result<OwnedFd> {
+        // SAFETY: `c"/"` je platný C řetězec; návratovou hodnotu kontroluje `owned_fd`.
+        owned_fd(unsafe {
+            libc::open(
+                c"/".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        })
+    }
+
+    fn open_dir(dir: &OwnedFd, name: &CString) -> io::Result<OwnedFd> {
+        // SAFETY: `dir` je otevřený adresář a `name` platný C řetězec.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        match owned_fd(fd) {
+            // Linux vrací u symlinku s O_DIRECTORY kód ENOTDIR, ne ELOOP.
+            Err(err) if err.raw_os_error() == Some(libc::ENOTDIR) && is_symlink(dir, name) => {
+                Err(io::Error::from_raw_os_error(libc::ELOOP))
+            }
+            result => result,
+        }
+    }
+
+    fn is_symlink(dir: &OwnedFd, name: &CString) -> bool {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `name` je C řetězec a `stat` je výstupní buffer volání `fstatat`.
+        // `AT_SYMLINK_NOFOLLOW` čte samotný symlink v adresáři, který už držíme.
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        // SAFETY: `fstatat` uspěl, takže buffer je inicializovaný.
+        let stat = unsafe { stat.assume_init() };
+        (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+    }
+
+    fn open_file(dir: &OwnedFd, name: &CString, mode: OpenMode) -> io::Result<OwnedFd> {
+        let access = match mode {
+            OpenMode::Read => libc::O_RDONLY,
+            // Čtení kvůli kontrole, zda soubor končí znakem nového řádku.
+            OpenMode::Append => libc::O_RDWR | libc::O_CREAT | libc::O_APPEND,
+            OpenMode::Write => libc::O_WRONLY | libc::O_CREAT,
+        };
+        // O_NONBLOCK: open na FIFO nebo zařízení nesmí čekat. Typ souboru se ověří až po
+        // otevření a příznak se pak zase shodí. O_NOCTTY: terminál se nestane řídicím.
+        let flags = access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        // Variadický argument: `mode_t` je na macOS `u16`, proto se předává jako `c_uint`.
+        let perms: libc::c_uint = 0o600;
+        // SAFETY: `dir` je otevřený adresář a `name` platný C řetězec.
+        owned_fd(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, perms) })
+    }
+
+    fn clear_nonblock(file: &File) -> io::Result<()> {
+        let fd = file.as_raw_fd();
+        // SAFETY: `fd` patří otevřenému `File`; F_GETFL/F_SETFL jen čtou a mění příznaky.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: viz výše.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn owned_fd(fd: RawFd) -> io::Result<OwnedFd> {
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` je právě otevřený deskriptor, který nikdo jiný nevlastní.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     fn flock_wait(fd: RawFd, op: i32) -> Result<(), Error> {
@@ -572,26 +548,12 @@ mod unix_fs {
                 }
             }
         }
-        if parts.is_empty() {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "prázdná cesta k logu",
-            ));
-        }
         Ok(parts)
     }
 
     fn c_name(name: &OsStr) -> io::Result<CString> {
         CString::new(name.as_bytes().to_vec())
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "složka cesty obsahuje znak NUL"))
-    }
-
-    fn cvt_fd(fd: RawFd) -> io::Result<RawFd> {
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(fd)
-        }
     }
 }
 

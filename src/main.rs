@@ -49,6 +49,8 @@ enum Command {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+        // Čtenář výstupu skončil dřív (`agent-log list | head`). Na logu se nic nepokazilo.
+        Err(agent_log::Error::Io(e)) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Chyba: {e}");
             ExitCode::FAILURE
@@ -59,22 +61,21 @@ fn main() -> ExitCode {
 fn run() -> Result<(), agent_log::Error> {
     let cli = Cli::parse();
     let base = std::env::current_dir()?;
+    let mut out = io::stdout().lock();
 
     match &cli.command {
         Command::Add { message } => {
             let entry = add_entry(&base, &cli.file, cli.allow_outside, message)?;
-            println!("{}", format_entry(&entry));
+            writeln!(out, "{}", format_entry(&entry))?;
         }
         Command::List { limit } => {
-            let stdout = io::stdout();
-            let mut out = stdout.lock();
             list_entries(&base, &cli.file, cli.allow_outside, *limit, &mut out)?;
-            out.flush()?;
         }
         Command::Clear => {
             clear_log(&base, &cli.file, cli.allow_outside)?;
-            println!("Log byl vymazán.");
+            writeln!(out, "Log byl vymazán.")?;
         }
     }
+    out.flush()?;
     Ok(())
 }

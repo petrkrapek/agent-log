@@ -32,9 +32,11 @@ Výstup používá čas RFC 3339 včetně pásma:
 - `--allow-outside` — povolí cestu mimo aktuální adresář
 - Proměnná prostředí `AGENT_LOG_FILE` — stejný efekt jako `--file`
 
-Cesta se jinak nesmí dostat ven z aktuálního adresáře. Symlink v cestě ani jako samotný soubor logu není povolený, ať už je `--allow-outside` zapnuté, nebo ne. Nový soubor vzniká s právy `0600` a existující log si nástroj při zápisu na tato práva srovná.
+Cesta se jinak nesmí dostat ven z aktuálního adresáře. Symlink v cestě ani jako samotný soubor logu není povolený, ať už je `--allow-outside` zapnuté, nebo ne. Log musí být obyčejný soubor bez dalšího pevného odkazu (hard linku); adresář, rouru (FIFO) ani zařízení nástroj nepoužije. Nový soubor vzniká s právy `0600` a existující log si nástroj při zápisu na tato práva srovná.
 
-Zpráva může mít nejvýš 4096 bajtů. `list` řídicí znaky ve výpisu nahradí, aby záznam nemohl přepsat terminál. Poškozený řádek přeskočí, vypíše ho na chybový výstup a skončí nenulovým kódem. Chybějící log není prázdný log: `list` v tom případě taky skončí chybou.
+Na macOS vedou `/tmp` i `/var` (a s ním `$TMPDIR`) přes symlink, takže je `--allow-outside` odmítne. Použijte skutečnou cestu, třeba `/private/tmp/agent.log` nebo `"$(realpath "$TMPDIR")/agent.log"`.
+
+Zpráva může mít nejvýš 4096 bajtů. `list` řídicí znaky ve výpisu nahradí, aby záznam nemohl přepsat terminál. Poškozený řádek přeskočí, vypíše ho na chybový výstup a skončí nenulovým kódem. Chybějící log není prázdný log: `list` v tom případě taky skončí chybou. `list` drží zámek jen během čtení souboru, takže otevřený pager (`agent-log list | less`) neblokuje zápis dalších záznamů.
 
 ## Formát logu
 
@@ -46,7 +48,7 @@ Záznamy se ukládají jako JSON Lines (jeden JSON objekt na řádek):
 
 ## Sestavení
 
-Vyžaduje Rust 1.85 nebo novější a Unix.
+Vyžaduje Rust 1.85 nebo novější a Unix (Linux, macOS).
 
 ```bash
 cargo build --release
