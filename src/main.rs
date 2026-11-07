@@ -1,24 +1,29 @@
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use chrono::Local;
+use agent_log::{add_entry, clear_log, format_entry, list_entries};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Entry {
-    ts: String,
-    message: String,
-}
 
 #[derive(Parser)]
-#[command(name = "agent-log", version, about = "Zaznamenává akce, které AI agent právě provádí")]
+#[command(
+    name = "agent-log",
+    version,
+    about = "Zaznamenává akce, které AI agent právě provádí"
+)]
 struct Cli {
-    /// Cesta k souboru s logem
-    #[arg(long, global = true, env = "AGENT_LOG_FILE", default_value = "agent.log")]
+    /// Cesta k souboru s logem. Musí zůstat v aktuálním adresáři, pokud není `--allow-outside`.
+    #[arg(
+        long,
+        global = true,
+        env = "AGENT_LOG_FILE",
+        default_value = "agent.log"
+    )]
     file: PathBuf,
+
+    /// Povolí cestu mimo aktuální adresář. Symlinky zůstávají zakázané.
+    #[arg(long, global = true)]
+    allow_outside: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -41,73 +46,35 @@ enum Command {
     Clear,
 }
 
-fn add_entry(file: &PathBuf, message: &str) -> std::io::Result<()> {
-    let entry = Entry {
-        ts: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        message: message.to_string(),
-    };
-    let mut f = OpenOptions::new().create(true).append(true).open(file)?;
-    let line = serde_json::to_string(&entry)?;
-    writeln!(f, "{line}")?;
-    println!("[{}] {}", entry.ts, entry.message);
-    Ok(())
-}
-
-fn list_entries(file: &PathBuf, limit: usize) -> std::io::Result<()> {
-    let f = match File::open(file) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("Log je prázdný.");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-
-    let entries: Vec<Entry> = BufReader::new(f)
-        .lines()
-        .filter_map(|l| l.ok())
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(&l).ok())
-        .collect();
-
-    if entries.is_empty() {
-        println!("Log je prázdný.");
-        return Ok(());
-    }
-
-    let shown = if limit == 0 {
-        &entries[..]
-    } else {
-        let start = entries.len().saturating_sub(limit);
-        &entries[start..]
-    };
-
-    for e in shown {
-        println!("[{}] {}", e.ts, e.message);
-    }
-    Ok(())
-}
-
-fn clear_log(file: &PathBuf) -> std::io::Result<()> {
-    std::fs::write(file, "")?;
-    println!("Log byl vymazán.");
-    Ok(())
-}
-
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    let result = match &cli.command {
-        Command::Add { message } => add_entry(&cli.file, message),
-        Command::List { limit } => list_entries(&cli.file, *limit),
-        Command::Clear => clear_log(&cli.file),
-    };
-
-    match result {
+    match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Chyba: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn run() -> Result<(), agent_log::Error> {
+    let cli = Cli::parse();
+    let base = std::env::current_dir()?;
+
+    match &cli.command {
+        Command::Add { message } => {
+            let entry = add_entry(&base, &cli.file, cli.allow_outside, message)?;
+            println!("{}", format_entry(&entry));
+        }
+        Command::List { limit } => {
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            list_entries(&base, &cli.file, cli.allow_outside, *limit, &mut out)?;
+            out.flush()?;
+        }
+        Command::Clear => {
+            clear_log(&base, &cli.file, cli.allow_outside)?;
+            println!("Log byl vymazán.");
+        }
+    }
+    Ok(())
 }
